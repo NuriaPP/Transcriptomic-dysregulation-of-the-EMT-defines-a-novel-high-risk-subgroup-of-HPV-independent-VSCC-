@@ -1,0 +1,389 @@
+---
+title: "Loading clinical data from Redcap"
+author: "Núria Peñuelas Peñarroya"
+date: "2025-01-13"
+output: html_document
+---
+
+#Packages
+```{r packages}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(tidyr)
+library(redcapAPI)
+library(gtsummary)
+library(magrittr)
+library(survival)
+```
+
+#Connection to Redcap API
+```{r}
+source("tokens.R")
+
+rcon_VSCC = redcapConnection(url = api_url,
+                                   token = token_VSCC)
+```
+
+#Export Redcap data by fields
+```{r}
+oncomine_followup <- exportRecordsTyped(
+  rcon = rcon_VSCC,
+  fields = c(
+    "study_id",
+    "age",
+    "group",
+    "infl_lesions",
+    "figo_2021_stage",
+    "figo_ini_ava",
+    "tumor_size",
+    "depth_invasion",
+    "hist_type",
+    "vli",
+    "snl_result",
+    "nodal_status",
+    "margins",
+    "radiotherapy",
+    "surgery_type",
+    "hpv_status",
+    "ciclina_d1",
+    "p53_ihc_status",
+    "oncomine_analysis",
+    "valid_oncomine",
+    "tp53_status_onc",
+    "oncomine_varclasf_1",
+    "ccnd1_cnv_onc",
+    "surgery_date",
+    "recurrence",
+    "recurrence_date",
+    "last_follow_up",
+    "status_last_followup",
+    "valid_prognostic"
+  )
+)
+
+WES <- exportRecordsTyped(
+  rcon = rcon_VSCC,
+  fields = c(
+    "tp53_status",
+    "vscc_vaf_1",
+    "bioinf_analysis",
+    "cnv",
+    "vscc_varclasf_1",
+    "ccnd1_status_new"))
+
+```
+
+#Merge the two different datasets from different worksheets and create a common TP53 status varibale from WES and Oncomine
+```{r}
+# Perform a full join to combine all rows, matching by `study_id`
+merged_data <- full_join(oncomine_followup, WES, by = "study_id")
+
+# Combine duplicate rows for the same `study_id` into a single row
+# Use summarization to keep all unique non-NA values for each column
+collapsed_data <- merged_data %>%
+  group_by(study_id) %>%
+  summarize(across(everything(), ~ paste(unique(na.omit(.)), collapse = "; "), .names = "{col}"), .groups = "drop")
+
+TP53status_clinical<-collapsed_data
+
+#Identify empty strings correctly as NA
+TP53status_clinical$tp53_status[TP53status_clinical$tp53_status == ""] <- NA
+TP53status_clinical$tp53_status_onc[TP53status_clinical$tp53_status_onc == ""] <- NA
+
+#Check NAs
+summary(TP53status_clinical$tp53_status_onc)
+table(is.na(TP53status_clinical$tp53_status_onc))
+
+summary(TP53status_clinical$tp53_status)
+table(is.na(TP53status_clinical$tp53_status))
+
+#Create in a new variable (tp53_status_combined) that if TP53 WES has no info, we consider the info from oncomine
+TP53status_clinical$tp53_status_combined <- ifelse(
+  is.na(TP53status_clinical$tp53_status),
+  TP53status_clinical$tp53_status_onc,
+  TP53status_clinical$tp53_status
+)
+
+#Check the values
+summary(TP53status_clinical$tp53_status_combined)
+table(is.na(TP53status_clinical$tp53_status_combined))
+
+```
+
+#Make IDs consistent between expression data and clinical data
+```{r}
+#To make ID formats consistent between clinical data and counts, we remove the first two characters after the "B" from the Study ID column in TP53status
+TP53status_clinical <- TP53status_clinical %>%
+  mutate(`study_id` = sub("^B\\d{2}", "B", `study_id`)) # Update Study ID in place
+
+#Also we change these 2 cases that have an alternative study_id: B2015-15290  for B17-38865 and B2008-08482 for B13-31747, which are the ones that are in the counts_filtered_data
+TP53status_clinical <- TP53status_clinical %>%
+  mutate(study_id = case_when(
+    study_id == "B15-15290" ~ "B17-38865",
+    study_id == "B08-08482" ~ "B13-31747",
+    TRUE ~ study_id  # Keep the rest unchanged
+  ))
+```
+
+
+
+#Load info on HE EMT patterns: tummor budding and patterns 
+```{r}
+#We load pattern/tumor budding information
+EMT_markers<- read_excel("EMT-Tumorbudding/20250227_Robert_combination_budding_morpho.xlsx")
+
+# Select only the desired columns from EMT_markers
+EMT_markers_selected <- EMT_markers %>% 
+  dplyr::select(id,Tumor_budding, Pattern, Combination, Combination2, Inflammatory)
+
+# Merge the selected columns with TP53status_clinical by id and Study_ID
+TP53status_clinical <- dplyr::left_join(TP53status_clinical, EMT_markers_selected, 
+                                   by = c("study_id" = "id"))
+
+# View the structure of the merged dataset
+str(TP53status_clinical)
+
+#20250512_We change the name of the patterns to spray and non-spray
+TP53status_clinical$Pattern <- ifelse(
+  TP53status_clinical$Pattern == "spray-like",
+  "spray",
+  "non-spray"
+)
+```
+
+
+#We exclude the cases that are in the clinical file but not in the expression dataset (HTG dataset)
+```{r}
+#Load the counts
+load("~/Projects/14. Clusters Lorena Survival/Survival Clusters Lorena/counts_filtered_filtered.RData")
+HTGcases<-c(colnames(counts_filtered_filtered))
+
+# Find matching IDs
+matching_ids <- intersect(HTGcases, TP53status_clinical$`study_id`)
+
+# Print the number of matching IDs
+print(length(matching_ids))  # This will give you the count of matching IDs
+
+# Filter rows where the processed ID matches IDs in TP53status_clinical
+TP53status_clinical <- TP53status_clinical %>%
+  filter(`study_id` %in% matching_ids)
+
+# Print the resulting filtered data
+print(TP53status_clinical)
+
+#Now we have the same 75 cases in both the TP53status and clinical data as in counts
+```
+
+
+
+#We create new variables in our clinical dataset
+```{r}
+TP53status_clinical <- TP53status_clinical %>%
+  rename(group_premalign = group)
+
+TP53status_clinical <- TP53status_clinical %>%
+  mutate(group_premalign_category = gsub("VSCC \\+ DEVIL|VSCC \\+ VAAD", 
+                                         "VSCC + DEVIL/VAAD", 
+                                         group_premalign))
+
+
+TP53status_clinical$inflammatory_lesions_group <- ifelse(
+  TP53status_clinical$infl_lesions___no == "Checked", "No",
+  ifelse(
+    TP53status_clinical$infl_lesions___lsc == "Checked" | 
+    TP53status_clinical$infl_lesions___les == "Checked" | 
+    TP53status_clinical$infl_lesions___lp == "Checked", 
+    "Yes", 
+    NA
+  )
+)  
+```
+
+
+
+#Format and create new variables in TP53status_clinical
+```{r}
+# Create a new column Recurrence_01 in AnnotData
+TP53status_clinical <- TP53status_clinical %>%
+  mutate(
+    # Convert numeric variables to numeric
+    age = as.numeric(age),
+    tumor_size = as.numeric(tumor_size),
+    depth_invasion = as.numeric(depth_invasion),
+    ciclina_d1= as.numeric(ciclina_d1), #There are 2 samples with no info -->NA introduced
+    
+     # Convert recurrence_date and surgery_date to Date type
+    recurrence_date = as.Date(recurrence_date, format = "%Y-%m-%d"),  # Adjust the format if necessary
+    surgery_date = as.Date(surgery_date, format = "%Y-%m-%d"),        # Adjust the format if necessary
+    last_follow_up = as.Date(last_follow_up, format = "%Y-%m-%d"),  # Adjust the format if necessary
+
+    
+    recurrence = ifelse(recurrence == "Yes", 1, 
+                        ifelse(recurrence == "No", 0, NA)),
+    #death_disease = ifelse(status_last_followup %in% c("Dead of disease", "Dead of other causes"), 1, 0),
+    death_disease = ifelse(status_last_followup == "Dead of disease", 1, 0),
+    
+    time_recurrence = as.numeric(difftime(recurrence_date, surgery_date, 
+                                          units = 'days') / (365.25 / 12)),
+    
+    time_last_followup = as.numeric(difftime(last_follow_up, surgery_date, 
+                                             units = 'days') / (365.25 / 12)),
+    
+    time_death_surv = time_last_followup,
+    
+    time_recurrence_surv = ifelse(!is.na(time_recurrence), time_recurrence, time_last_followup)
+  )
+```
+
+
+#We exclude those with no TP53information in the clinical file and in the counts as well
+```{r}
+TP53status_clinical <- TP53status_clinical[!TP53status_clinical$study_id %in% c("B12-27987", "B16-24861"), ]
+
+counts_filtered_filtered <- counts_filtered_filtered[, !(names(counts_filtered_filtered) %in% c("B12-27987", "B16-24861"))]
+
+#15/05/2025: There is another that has no info on TP53! B18-21625!!! De moment només el trec per fer els analisis de survival ajustant per TP53...no als counts...
+TP53status_clinical <- TP53status_clinical[!is.na(TP53status_clinical$tp53_status_combined), ]
+
+#19/05/2025: La Lorena m'ha dit que ella té el cas  B18-21625 com a wt..
+TP53status_clinical$tp53_status_combined[TP53status_clinical$study_id == "B18-21625"] <- "Wt"
+
+
+# Check results
+dim(counts_filtered_filtered)
+#There are now n=73 (75 - 2 cases without no TP53status information) HPV-Independent, 10513 genes
+
+#We check the numbers of TP53 mutated cases in HPV-independent group
+#table(TP53status_clinical$group)
+#There are n=42 TP53-mutated and n=12 TP53-wt in HPV-independent cases
+
+
+```
+#Format and create new variables in our clinical dataset
+```{r}
+#SNL result
+#There are 30 cases whith no info on SNL result, but they are not NA...
+table(TP53status_clinical$snl_result)
+is.na(TP53status_clinical$snl_result)
+
+#We consider negative when no info
+TP53status_clinical <- TP53status_clinical %>%
+  mutate(snl_result = ifelse(!snl_result %in% c("Negative", "Positive"), "Negative", snl_result))
+
+#Nodal status
+#There are 10 cases whith nd in nodal status and 1 with no info, but no NA
+table(TP53status_clinical$nodal_status)
+is.na(TP53status_clinical$snl_result)
+
+# Replace all "nd" values with 0
+TP53status_clinical$nodal_status[TP53status_clinical$nodal_status == "nd"] <- "0"
+table(TP53status_clinical$nodal_status)
+
+#We check the case that has an empty string
+print(TP53status_clinical$nodal_status[TP53status_clinical$study_id == "B23-26785"])
+
+# Update nodal_status to "0" for the specific id
+TP53status_clinical$nodal_status[TP53status_clinical$study_id == "B23-26785"] <- "0"
+
+# Verify the update
+print(TP53status_clinical$nodal_status[TP53status_clinical$study_id == "B23-26785"])
+
+
+#Categorize some categorical/continuous variables to two categories
+TP53status_clinical <- TP53status_clinical %>%
+  mutate(
+    hpv_status= as.factor(hpv_status),
+    hist_type_category = case_when(
+      hist_type %in% c("Basaloid", "Warty", "Non-keratinizing",
+                       "Basaloid/Warty","Basaloid/Keratinizing","Warty/Keratinizing") ~
+                       "Basaloid/warty/nonkeratinizing",
+      hist_type %in% c("Keratinizing", "Verrucous") ~ "Keratinizing/verrucous",
+      TRUE ~ "Unknown" # For unexpected or empty values
+    ),
+    tumor_size_category = case_when(
+      tumor_size <= 25 ~ "≤25 mm",
+      tumor_size > 25 ~ ">25 mm",
+      TRUE ~ "Unknown"  # Handles missing or unexpected values
+    ),
+    depth_invasion_category = case_when(
+      depth_invasion <= 5 ~ "≤5 mm",
+      depth_invasion > 5 ~ ">5 mm",
+      TRUE ~ "Unknown"  # Handles missing or unexpected values
+    ),
+    surgery_type_category = case_when(
+      surgery_type == "Local exeresis" ~ "Local wide excision",
+      surgery_type == "Partial vulvectomy" ~ "Local wide excision",
+      surgery_type == "Radical vulvectomy" ~ "Radical vulvectomy",
+      TRUE ~ surgery_type  # Keeps other values unchanged if any
+    ),
+    vli=as.factor(vli))
+```
+
+
+
+# Convert some variables to factors and explicitly set reference levels for cox analysis
+```{r}
+# Convert to factor and explicitly set reference levels for cox analysis
+TP53status_clinical$hpv_status <- factor(TP53status_clinical$hpv_status, levels = c("Positive", "Negative"))
+TP53status_clinical$figo_ini_ava <- factor(TP53status_clinical$figo_ini_ava, levels = c("0 (Initial)", "1 (Advanced)"))
+TP53status_clinical$margins <- factor(TP53status_clinical$margins, levels = c("Free", "Affected"))
+TP53status_clinical$nodal_status <- factor(TP53status_clinical$nodal_status, levels = c("0", "1"))
+
+TP53status_clinical$tumor_size_category <- factor(
+  TP53status_clinical$tumor_size_category,
+  levels = c("≤25 mm", ">25 mm")
+)
+TP53status_clinical$depth_invasion_category <- factor(
+  TP53status_clinical$depth_invasion_category,
+  levels = c("≤5 mm", ">5 mm")
+)
+
+TP53status_clinical$hist_type_category <- factor(
+  TP53status_clinical$hist_type_category,
+  levels = c("Basaloid/warty/nonkeratinizing", "Keratinizing/verrucous")
+)
+```
+
+
+
+#We check that we have the same cases in our clinical file and in the expression dataset (HTG counts)
+```{r}
+# Find matching IDs
+matching_ids <- intersect(HTGcases, TP53status_clinical$`study_id`)
+print(matching_ids)
+
+
+# Find IDs in HTGcases that are not in TP53status_clinical$study_id
+nonmatching_in_HTGcases <- setdiff(HTGcases, TP53status_clinical$study_id)
+print("Nonmatching IDs in HTGcases:")
+print(nonmatching_in_HTGcases)
+```
+
+
+
+
+#We prepare the data for HTG function
+```{r}
+identical(colnames(counts_filtered_filtered), TP53status_clinical$study_id)
+#We see that the colnames in counts and $study_id in TP53status_clinical are not identical and they have to be for TME function
+```
+
+```{r}
+#HTG function needs a data.frame
+TP53status_clinical<- as.data.frame(TP53status_clinical)
+
+#HTG function looks for "id" column in Annotdata:
+TP53status_clinical <- TP53status_clinical %>%
+  rename(id = `study_id`)
+
+## HTG function requires rownames and columns to be ordered in the same 
+TP53status_clinical <- TP53status_clinical[order(TP53status_clinical$id), ]
+counts_filtered_filtered<- counts_filtered_filtered[,order(colnames(counts_filtered_filtered))]
+
+#We confirm that the rows in clinical file correspond to the columns in the counts file
+identical(colnames(counts_filtered_filtered), TP53status_clinical$id)
+```
+
+

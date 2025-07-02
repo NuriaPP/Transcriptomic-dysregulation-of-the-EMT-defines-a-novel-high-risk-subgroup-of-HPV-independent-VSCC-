@@ -1,0 +1,297 @@
+---
+title: "Categorization of variables and descriptive tables"
+author: "Núria Peñuelas Peñarroya"
+date: "2024-11-25"
+output: html_document
+---
+
+# **NORMALITY TESTS**
+#We perform Anderson-Darling tests to examine the distribution of the numerical variables
+
+```{r packages}
+library(gtsummary)
+library(magrittr)
+library(nortest)
+library(knitr)
+library(dplyr)
+library(writexl)
+```
+
+# Normality in continuous variables, we choose Ad test because we have a datset n>50. For larger datasets (n>50), other tests like the Kolmogorov-Smirnov test, Anderson-Darling test, or Lilliefors test may be more robust alternatives. 
+
+```{r}
+numeric_data <- select_if(TP53status_clinical, is.numeric)
+print(colnames(numeric_data))
+
+
+# Filter numeric columns with sufficient unique values
+numeric_data <- numeric_data %>% select_if(~ length(unique(.)) > 1)
+
+# Remove rows with NA in numeric data
+cleaned_data <- numeric_data %>% drop_na()
+
+# Create an empty dataframe to store results
+results_df <- data.frame(Variable = character(),
+                         Test_utilizado = character(),
+                         Valor_p = numeric(),
+                         Interpretación = character(),
+                         stringsAsFactors = FALSE)
+
+# Loop to check normality
+for (col in colnames(cleaned_data)) {
+  # Extract column data
+  data_to_test <- cleaned_data[[col]]
+  
+  # Only proceed if there are enough data points
+  if (length(data_to_test) > 1) {
+    # Test Anderson-Darling
+    ad_test <- ad.test(data_to_test)
+    
+    # Interpretation
+    if (!is.na(ad_test$p.value) && ad_test$p.value < 0.05) {
+      normality <- "Non-normal distribution"
+    } else if (!is.na(ad_test$p.value)) {
+      normality <- "Normal distribution"
+    } else {
+      normality <- "No p-value"
+    }
+    
+    # Add the results into the dataframe
+    results_df <- rbind(results_df, data.frame(Variable = col,
+                                               Test_utilizado = "Anderson-Darling",
+                                               Valor_p = ifelse(is.na(ad_test$p.value), NA, round(ad_test$p.value, digits = 3)),
+                                               Interpretación = normality))
+  }
+}
+
+# Print results
+print(results_df)
+
+#We print the results
+knitr::kable(results_df, caption = "Summary normal distribution of numeric variables")
+
+```
+
+
+#As we see that all variables are non-normal, we will perform Mann–Whitney U test in all the comparisons for numeric variables. Mann–Whitney U test, also called Mann–Whitney–Wilcoxon (MWW/MWU), Wilcoxon rank-sum test, or Wilcoxon–Mann–Whitney test is a nonparametric test appropiate for non-normal variables. For tables where there are 3 groups, we will use kruskal wallis for numeric variables.
+
+
+# **DESCRIPTIVE TABLES**
+
+```{r}
+#Select the variables of interest
+descriptive_HTG<- TP53status_clinical %>% select(
+    "hpv_status",
+    "age",
+    "figo_ini_ava",
+    "tumor_size",
+    "tumor_size_category",
+    "depth_invasion",
+    "depth_invasion_category",
+    "hist_type_category",
+    "vli",
+    "nodal_status",
+    "margins",
+    "inflammatory_lesions_group",
+    "radiotherapy",
+    "surgery_type_category",
+    "tp53_status_combined",
+    "p53_ihc_status",
+    "death_disease_60m",
+    "recurrence_60m"
+    )
+```
+
+
+#1. By HPV status
+```{r}
+# Ensure hpv_status is a factor (if not already)
+descriptive_HTG$hpv_status <- as.factor(descriptive_HTG$hpv_status)
+
+
+descriptive_table_HPVstatus <- descriptive_HTG %>%
+  tbl_summary(
+    by = hpv_status,
+    statistic = list(
+      all_categorical() ~ "{n} / {N} ({p}%)",
+      all_continuous() ~ "{median} ({p25}, {p75})"
+    ),
+    type = list(
+      figo_ini_ava ~ "categorical",
+      tumor_size_category ~ "categorical",
+      depth_invasion_category ~ "categorical",
+      hist_type_category ~ "categorical",
+      vli ~ "categorical",
+      nodal_status ~ "categorical",
+      margins ~ "categorical",
+      radiotherapy ~ "categorical",
+      surgery_type_category ~ "categorical",
+      tp53_status_combined ~ "categorical",
+      p53_ihc_status ~ "categorical",
+      recurrence_60m ~ "categorical",
+      death_disease_60m ~ "categorical"
+    ),
+    digits = list(
+      all_categorical() ~ c(0, 0, 1),
+      all_continuous() ~ 1
+    )
+  ) %>%
+  add_p(
+    test = list(
+      all_categorical() ~ function(data, variable, by, ...) {
+        # Fisher test with simulated p-value
+        result <- fisher.test(data[[variable]], data[[by]], simulate.p.value = TRUE)
+        tibble::tibble(p.value = result$p.value)  # Return as tibble
+      },
+      all_continuous() ~ function(data, variable, by, ...) {
+        # Wilcoxon test with approximate p-value
+        result <- wilcox.test(data[[variable]] ~ data[[by]], exact = FALSE)
+        tibble::tibble(p.value = result$p.value)  # Return as tibble
+      }
+    ),
+    pvalue_fun = ~ style_pvalue(.x, digits = 3)
+  )
+
+descriptive_table_HPVstatus
+
+```
+
+
+
+
+
+
+#2. By C2 and C3
+#At the begining clusters were named C1(mostly HPV-independent, n=14) C2(mostly HPV-independent, n=42) C3 (mostly HPV-associated) and now we have changed the naming of C3 to C1 and C1 to C3 to keepn on with the logic of the paper
+
+
+```{r}
+#Select the variables of interest
+descriptive_HTG<- TP53status_clinical %>% select(
+    "hpv_status",
+    "Clusters",
+    "age",
+    "figo_ini_ava",
+    "tumor_size",
+    "tumor_size_category",
+    "depth_invasion",
+    "depth_invasion_category",
+    "hist_type_category",
+    "vli",
+    "nodal_status",
+    "margins",
+    "inflammatory_lesions_group",
+    "radiotherapy",
+    "surgery_type_category",
+    "tp53_status_combined",
+    "p53_ihc_status",
+    "death_disease_60m",
+    "recurrence_60m"
+    )
+```
+
+```{r}
+descriptive_table_2clusters <- descriptive_HTG %>%
+  filter(!(Clusters== "Cluster 3")) %>%  # Exclude rows where cluster is "Cluster 3"
+  droplevels() %>%  # Drop the unused "Cluster 3" factor level
+  tbl_summary(
+    by = Clusters,
+    statistic = list(
+      all_categorical() ~ "{n} / {N} ({p}%)",
+      all_continuous() ~ "{median} ({p25}, {p75})"
+    ),
+    type = list(
+      figo_ini_ava ~ "categorical",
+      hpv_status ~ "categorical",
+      tumor_size_category ~ "categorical",
+      depth_invasion_category ~ "categorical",
+      hist_type_category ~ "categorical",
+      inflammatory_lesions_group ~ "categorical",
+      vli ~ "categorical",
+      nodal_status ~ "categorical",
+      margins ~ "categorical",
+      radiotherapy ~ "categorical",
+      surgery_type_category ~ "categorical",
+      p53_ihc_status ~ "categorical",
+      tp53_status_combined ~ "categorical",
+      recurrence_60m ~ "categorical",
+      death_disease_60m ~ "categorical"
+    ),
+    digits = list(
+      all_categorical() ~ c(0, 0, 1),
+      all_continuous() ~ 1
+    )
+  ) %>%
+  add_p(
+    test = list(
+      all_categorical() ~ function(data, variable, by, ...) {
+        # Fisher test with simulated p-value
+        result <- fisher.test(data[[variable]], data[[by]], simulate.p.value = TRUE)
+        tibble::tibble(p.value = result$p.value)  # Return as tibble
+      },
+      all_continuous() ~ function(data, variable, by, ...) {
+        # Wilcoxon test with approximate p-value
+        result <- wilcox.test(data[[variable]] ~ data[[by]], exact = FALSE)
+        tibble::tibble(p.value = result$p.value)  # Return as tibble
+      }
+    ),
+    pvalue_fun = ~ style_pvalue(.x, digits = 3)
+  )
+
+descriptive_table_2clusters
+```
+
+
+
+
+
+
+#3. By TP53 mutation (only HPV-indepenent cases) (Supplementary)
+```{r}
+descriptive_table_TP53_HPV_ind <- descriptive_HTG %>%
+  filter(hpv_status == "Negative") %>%  # Filter for HPV positive
+  tbl_summary(
+    by = tp53_status_combined,
+    statistic = list(
+      all_categorical() ~ "{n} / {N} ({p}%)",
+      all_continuous() ~ "{median} ({p25}, {p75})"
+    ),
+    type = list(
+      figo_ini_ava ~ "categorical",
+      tumor_size_category ~ "categorical",
+      depth_invasion_category ~ "categorical",
+      hist_type_category ~ "categorical",
+      inflammatory_lesions_group ~ "categorical",
+      vli ~ "categorical",
+      nodal_status ~ "categorical",
+      margins ~ "categorical",
+      radiotherapy ~ "categorical",
+      surgery_type_category ~ "categorical",
+      p53_ihc_status ~ "categorical",
+      recurrence_60m ~ "categorical",
+      death_disease_60m ~ "categorical"
+    ),
+    digits = list(
+      all_categorical() ~ c(0, 0, 1),
+      all_continuous() ~ 1
+    )
+  ) %>%
+  add_p(
+    test = list(
+      all_categorical() ~ function(data, variable, by, ...) {
+        # Fisher test with simulated p-value
+        result <- fisher.test(data[[variable]], data[[by]], simulate.p.value = TRUE)
+        tibble::tibble(p.value = result$p.value)  # Return as tibble
+      },
+      all_continuous() ~ function(data, variable, by, ...) {
+        # Wilcoxon test with approximate p-value
+        result <- wilcox.test(data[[variable]] ~ data[[by]], exact = FALSE)
+        tibble::tibble(p.value = result$p.value)  # Return as tibble
+      }
+    ),
+    pvalue_fun = ~ style_pvalue(.x, digits = 3)
+  )
+
+descriptive_table_TP53_HPV_ind
+```
+

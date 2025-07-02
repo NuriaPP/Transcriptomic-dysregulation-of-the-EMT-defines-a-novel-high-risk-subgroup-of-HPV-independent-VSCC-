@@ -1,0 +1,905 @@
+---
+title: "Clusters Manhatan-Ward2"
+author: "Núria Peñuelas Peñarroya"
+date: "2025-01-16"
+output: html_document
+---
+
+```{r packages}
+library(survminer)
+library(survival)
+library(coxphf)
+library(knitr)
+library(readr)
+```
+
+
+
+#There is one case that has been just very recently updated to invalid prognosis(B2018-05127) but for neoadjuvant therapy, not palliative treatment so we still want to include it.
+```{r}
+# Manually include B2018-05127 even if marked as "No"
+valid_ids <- TP53status_clinical$id[
+  TP53status_clinical$valid_prognostic == "Yes" |
+  TP53status_clinical$id == "B18-05127"
+]
+
+# Filter the clinical dataframe accordingly
+TP53status_clinical <- TP53status_clinical[TP53status_clinical$id %in% valid_ids, ]
+
+# Filter the RNA expression dataframe to keep only valid columns
+counts_filtered_filtered <- counts_filtered_filtered[, colnames(counts_filtered_filtered) %in% valid_ids]
+
+# Verify dimensions
+print(dim(TP53status_clinical))       # Should now include B2018-05127
+print(dim(counts_filtered_filtered))  # Should match updated sample IDs
+
+```
+
+#We load information on EMT pattern by IHC Cadherin and Vimentin and IHC mTORc results
+```{r}
+
+EMT_VIM_Cadh_mTORC_info <- read_csv("EMT_VIM+Cadh_mTORC_info.csv")
+
+
+
+# We count how many TP53 IDs are present in the EMT dataset, to confirm we have info on all 70
+matching_ids <- TP53status_clinical$id %in% EMT_VIM_Cadh_mTORC_info$Tumor_Sample_ID
+sum(matching_ids)
+#We have info on all 70 cases
+
+# View non-matching IDs
+unmatched_ids <- TP53status_clinical$id[!matching_ids]
+unmatched_ids
+
+
+# Subset relevant columns from EMT_VIM_Cadh_mTORC_info
+subset_info <- EMT_VIM_Cadh_mTORC_info[,c("Tumor_Sample_ID","Clusters","EMT_phenotype_Ecadh_Vimentin", "mTOR")]
+
+
+# Rename columns to make merge clearer
+colnames(subset_info)[colnames(subset_info) == "Tumor_Sample_ID"] <- "id"
+
+# Merge with TP53status_clinical on 'id'
+TP53status_clinical<- merge(TP53status_clinical, subset_info, by = "id", all.x = TRUE)
+```
+
+
+#We create survival variables for different cutoffs
+#1. All 3 clusters
+```{r}
+
+# Define the time points for follow-up
+time_points <- c(10, 12, 20, 24, 30, 36, 40, 48, 50, 60)
+
+# Loop through each cutoff we want to assess to create time-restricted variables
+for (time_point in time_points) {
+  TP53status_clinical <- TP53status_clinical %>%
+    mutate(
+      # Create time-restricted survival variables: cap the times at the time_point
+      !!paste0("time_recurrence_surv_", time_point, "m") := pmin(time_recurrence_surv, time_point),  # cap to time_point
+      !!paste0("time_death_surv_", time_point, "m") := pmin(time_death_surv, time_point),  # cap to time_point
+
+      # Create event indicator variables for recurrence and death
+      # If the event time is greater than the time point, event does not occur (0)
+      !!paste0("recurrence_", time_point, "m") := ifelse(time_recurrence_surv <= time_point & recurrence == 1, 1, 0),
+      !!paste0("death_disease_", time_point, "m") := ifelse(time_death_surv <= time_point & death_disease == 1, 1, 0)
+    )
+}
+
+# We convert the main variables (recurrence and death disease) as a factor
+TP53status_clinical <- TP53status_clinical %>%
+  mutate(
+    # Convert the base recurrence and death variables to factors
+    recurrence = factor(recurrence, levels = c(0, 1), labels = c("No", "Yes")),
+    death_disease = factor(death_disease, levels = c(0, 1), labels = c("No", "Yes"))
+  )
+
+# Loop through each time point to convert the event indicators into factors
+for (time_point in time_points) {
+  TP53status_clinical <- TP53status_clinical %>%
+    mutate(
+      !!paste0("recurrence_", time_point, "m") := factor(get(paste0("recurrence_", time_point, "m")), levels = c(0, 1), labels = c("No", "Yes")),
+      !!paste0("death_disease_", time_point, "m") := factor(get(paste0("death_disease_", time_point, "m")), levels = c(0, 1), labels = c("No", "Yes"))
+    )
+}
+
+# Verify structure
+str(TP53status_clinical)
+
+```
+
+
+# We check for proper conversion of all variables
+```{r}
+# Check missing values for critical variables
+colSums(is.na(TP53status_clinical[c("time_last_followup", "time_recurrence", "recurrence", "death_disease")]))
+
+summary(TP53status_clinical$time_recurrence_surv)
+summary(TP53status_clinical$time_death_surv)
+
+
+for (time_point in time_points) {
+  cat("\nTime Point:", time_point, "months\n")
+  print(table(TP53status_clinical[[paste0("recurrence_", time_point, "m")]]))
+}
+
+for (time_point in time_points) {
+  TP53status_clinical <- TP53status_clinical %>%
+    mutate(
+      time_recurrence_surv_temp = pmin(time_recurrence_surv, time_point),
+      recurrence_temp = ifelse(time_recurrence_surv <= time_point & recurrence == 1, 1, 0)
+    )
+  cat("\nTime Point:", time_point, "\n")
+  print(table(TP53status_clinical$recurrence_temp, useNA = "ifany"))
+}
+```
+
+
+
+
+#1. By Clusters
+#Pattern_Kaplan Meyer recurrence individual plot
+```{r}
+# Define the custom colors with more reddish orange
+custom_colors <- c("#009E73", "#D45F00", "#0072B2")
+
+# Filter for Cluster 1 and 2 only
+filtered_data <- TP53status_clinical %>%
+  filter(Clusters %in% c("Cluster 1", "Cluster 2"))
+dim(filtered_data)
+#We have 57 cases from C1+C2
+
+# Create the survival object
+surv_obj <- Surv(time = filtered_data$time_recurrence_surv_60m, 
+                 event = as.numeric(filtered_data$recurrence_60m == "Yes"))
+
+# Fit the Kaplan-Meier survival model
+km_fit <- survfit(surv_obj ~ Clusters, data = filtered_data)
+
+# Plot the Kaplan-Meier survival curves
+p <- ggsurvplot(
+  km_fit, 
+  data = filtered_data,
+  pval = TRUE,
+  title = "Kaplan-Meier Survival Curve by Clusters_Recurrence (Cluster 1 & 2 Only)",
+  risk.table = TRUE,
+  risk.table.height = 0.3,
+  xlab = "Time to Event (Months)",
+  ylab = "Survival Probability",
+  break.time.by = 10,
+  palette = custom_colors,
+  legend = c(0.8, 0.2),
+  legend.title = "Clusters"
+)
+
+# Display the plot
+print(p)
+
+```
+
+
+
+#Pattern_Kaplan Meyer death individual plot
+```{r}
+# Create the survival object
+surv_obj <- Surv(time = filtered_data$time_death_surv_60m, 
+                 event = as.numeric(filtered_data$death_disease_60m == "Yes"))
+
+# Fit the Kaplan-Meier survival model
+km_fit <- survfit(surv_obj  ~ Clusters, data = filtered_data)
+
+
+# Plot the Kaplan-Meier survival curves
+p <- ggsurvplot(
+  km_fit, 
+  data = filtered_data,
+  pval = TRUE,                    # Display the p-value for the log-rank test
+  title = "Kaplan-Meier Survival Curve by Clusters_Death",
+  risk.table = TRUE,              # Include the risk table
+  risk.table.height = 0.3,        # Adjust the height of the risk table
+  xlab = "Time to Event (Months)",# Label for x-axis
+  ylab = "Survival Probability",   # Label for y-axis
+  break.time.by = 10,               # Adjust time interval to match plot
+  palette = custom_colors, # Use the custom color palette
+  legend = c(0.8, 0.2),           # Adjust legend position (optional)
+  legend.title = "Clusters"  # Customize legend labels
+) 
+
+# Add the title to the plot
+p$plot <- p$plot + ggtitle("Kaplan-Meier Survival Curve by Clusters_Death")
+
+# Display the plot
+print(p)
+
+
+```
+
+
+
+
+#2. By EMT pattern Cadh-Vim
+#Kaplan Meyer recurrence individual plot
+```{r}
+
+
+
+# Filter out rows where EMT_phenotype_Ecadh_Vimentin is "N/A"
+filtered_data <- TP53status_clinical %>%
+  filter(Clusters %in% c("Cluster 1", "Cluster 2"))%>%
+  filter(EMT_phenotype_Ecadh_Vimentin != "N/A")
+
+dim(filtered_data)
+#We have 54 cases with info on EMT (and C1 and C2)
+
+# Create the survival object
+surv_obj <- Surv(time = filtered_data$time_recurrence_surv_60m, 
+                 event = as.numeric(filtered_data$recurrence_60m == "Yes"))
+
+# Fit the Kaplan-Meier survival model
+km_fit <- survfit(surv_obj ~ EMT_phenotype_Ecadh_Vimentin, data = filtered_data)
+
+# Plot the Kaplan-Meier survival curves
+p <- ggsurvplot(
+  km_fit, 
+  data = filtered_data,
+  pval = TRUE,
+  title = "Kaplan-Meier Survival Curve by EMT_phenotype_Ecadh_Vimentin_Recurrence (Cluster 1 & 2 Only)",
+  risk.table = TRUE,
+  risk.table.height = 0.3,
+  xlab = "Time to Event (Months)",
+  ylab = "Survival Probability",
+  break.time.by = 10,
+  palette = custom_colors,
+  legend = c(0.8, 0.2),
+  legend.title = "Clusters"
+)
+
+# Display the plot
+print(p)
+
+```
+
+
+
+#Pattern_Kaplan Meyer death individual plot
+```{r}
+# Create the survival object
+surv_obj <- Surv(time = filtered_data$time_death_surv_60m, 
+                 event = as.numeric(filtered_data$death_disease_60m == "Yes"))
+
+# Fit the Kaplan-Meier survival model
+km_fit <- survfit(surv_obj  ~ EMT_phenotype_Ecadh_Vimentin, data = filtered_data)
+
+
+# Plot the Kaplan-Meier survival curves
+p <- ggsurvplot(
+  km_fit, 
+  data = filtered_data,
+  pval = TRUE,                    # Display the p-value for the log-rank test
+  title = "Kaplan-Meier Survival Curve by Clusters_Death",
+  risk.table = TRUE,              # Include the risk table
+  risk.table.height = 0.3,        # Adjust the height of the risk table
+  xlab = "Time to Event (Months)",# Label for x-axis
+  ylab = "Survival Probability",   # Label for y-axis
+  break.time.by = 10,               # Adjust time interval to match plot
+  palette = custom_colors, # Use the custom color palette
+  legend = c(0.8, 0.2),           # Adjust legend position (optional)
+  legend.title = "Clusters"  # Customize legend labels
+) 
+
+# Add the title to the plot
+p$plot <- p$plot + ggtitle("Kaplan-Meier Survival Curve by EMT_phenotype_Ecadh_Vimentin_Death (Cluster 1 & 2 Only)")
+
+# Display the plot
+print(p)
+```
+
+
+
+#3. By mTORC IHC
+#Kaplan Meyer recurrence individual plot
+```{r}
+
+# Define the custom colors with more reddish orange
+custom_colors <- c("#009E73", "#D45F00", "#0072B2")
+
+
+# Recode mTOR values in the original data
+filtered_data <- TP53status_clinical %>%
+  mutate(mTOR = ifelse(mTOR %in% c("n/a (no tumor)", "no tumor", "N/A"), NA, mTOR))
+dim(filtered_data)
+#70 cases
+
+# Filter for Clusters C1 and C2 and remove NAs in mTOR
+filtered_data <- filtered_data %>%
+  filter(Clusters %in% c("Cluster 1", "Cluster 2") & !is.na(mTOR))
+
+dim(filtered_data)
+#We have 51 cases with info mTOR (and C1 and C2)
+
+# Create the survival object
+surv_obj <- Surv(time = filtered_data$time_recurrence_surv_60m, 
+                 event = as.numeric(filtered_data$recurrence_60m == "Yes"))
+
+# Fit the Kaplan-Meier survival model
+km_fit <- survfit(surv_obj ~ mTOR, data = filtered_data)
+
+# Plot the Kaplan-Meier survival curves
+p <- ggsurvplot(
+  km_fit, 
+  data = filtered_data,
+  pval = TRUE,
+  title = "Kaplan-Meier Survival Curve by mTOR_Recurrence (Cluster 1 & 2 Only)",
+  risk.table = TRUE,
+  risk.table.height = 0.3,
+  xlab = "Time to Event (Months)",
+  ylab = "Survival Probability",
+  break.time.by = 10,
+  palette = custom_colors,
+  legend = c(0.8, 0.2),
+  legend.title = "Clusters"
+)
+
+# Display the plot
+print(p)
+
+```
+
+
+
+#Pattern_Kaplan Meyer death individual plot
+```{r}
+# Create the survival object
+surv_obj <- Surv(time = filtered_data$time_death_surv_60m, 
+                 event = as.numeric(filtered_data$death_disease_60m == "Yes"))
+
+# Fit the Kaplan-Meier survival model
+km_fit <- survfit(surv_obj  ~ mTOR, data = filtered_data)
+
+
+# Plot the Kaplan-Meier survival curves
+p <- ggsurvplot(
+  km_fit, 
+  data = filtered_data,
+  pval = TRUE,                    # Display the p-value for the log-rank test
+  title = "Kaplan-Meier Survival Curve by mTOR_Death",
+  risk.table = TRUE,              # Include the risk table
+  risk.table.height = 0.3,        # Adjust the height of the risk table
+  xlab = "Time to Event (Months)",# Label for x-axis
+  ylab = "Survival Probability",   # Label for y-axis
+  break.time.by = 10,               # Adjust time interval to match plot
+  palette = custom_colors, # Use the custom color palette
+  legend = c(0.8, 0.2),           # Adjust legend position (optional)
+  legend.title = "Clusters"  # Customize legend labels
+) 
+
+# Add the title to the plot
+p$plot <- p$plot + ggtitle("Kaplan-Meier Survival Curve by mTOR_Death (Cluster 1 & 2 Only)")
+
+# Display the plot
+print(p)
+```
+
+
+
+
+
+#4. By HE EMT Pattern
+
+#Kaplan Meyer recurrence individual plot
+```{r}
+# Create the survival object
+surv_obj <- Surv(time = TP53status_clinical$time_recurrence_surv_60m, 
+                 event = as.numeric(TP53status_clinical$recurrence_60m == "Yes"))
+
+# Fit the Kaplan-Meier survival model
+km_fit <- survfit(surv_obj  ~ Pattern, data = TP53status_clinical)
+
+
+# Plot the Kaplan-Meier survival curves
+p <- ggsurvplot(
+  km_fit, 
+  data = TP53status_clinical,
+  pval = TRUE,                    # Display the p-value for the log-rank test
+  title = "Kaplan-Meier Survival Curve by Pattern_Recurrence",
+  risk.table = TRUE,              # Include the risk table
+  risk.table.height = 0.3,        # Adjust the height of the risk table
+  xlab = "Time to Event (Months)",# Label for x-axis
+  ylab = "Survival Probability",   # Label for y-axis
+  break.time.by = 10,               # Adjust time interval to match plot
+  palette = custom_colors, # Use the custom color palette
+  legend = c(0.8, 0.2),           # Adjust legend position (optional)
+  legend.title = "Clusters"  # Customize legend labels
+) 
+
+# Add the title to the plot
+p$plot <- p$plot + ggtitle("Kaplan-Meier Survival Curve by Pattern_Recurrence")
+
+# Display the plot
+print(p)
+```
+
+
+
+
+#Pattern_Kaplan Meyer death individual plot
+```{r}
+# Create the survival object
+surv_obj <- Surv(time = TP53status_clinical$time_death_surv_60m, 
+                 event = as.numeric(TP53status_clinical$death_disease_60m == "Yes"))
+
+# Fit the Kaplan-Meier survival model
+km_fit <- survfit(surv_obj  ~ Pattern, data = TP53status_clinical)
+
+
+# Plot the Kaplan-Meier survival curves
+p <- ggsurvplot(
+  km_fit, 
+  data = TP53status_clinical,
+  pval = TRUE,                    # Display the p-value for the log-rank test
+  title = "Kaplan-Meier Survival Curve by Pattern_Death",
+  risk.table = TRUE,              # Include the risk table
+  risk.table.height = 0.3,        # Adjust the height of the risk table
+  xlab = "Time to Event (Months)",# Label for x-axis
+  ylab = "Survival Probability",   # Label for y-axis
+  break.time.by = 10,               # Adjust time interval to match plot
+  palette = custom_colors, # Use the custom color palette
+  legend = c(0.8, 0.2),           # Adjust legend position (optional)
+  legend.title = "Clusters"  # Customize legend labels
+) 
+
+# Add the title to the plot
+p$plot <- p$plot + ggtitle("Kaplan-Meier Survival Curve by Pattern_Death")
+
+# Display the plot
+print(p)
+
+
+```
+
+
+#EMT HE Pattern_Cox univariate recurrence
+```{r}
+univ_recurrence_Pattern <- coxphf(
+  Surv(time_recurrence_surv_60m, recurrence_60m) ~ Pattern,
+  data = TP53status_clinical,
+  maxstep = 0.0001, 
+  maxit = 100000
+)
+
+# Extract coefficients, hazard ratios, and confidence intervals
+univ_recurrence_Pattern_table <- data.frame(
+  coef = univ_recurrence_Pattern$coefficients,
+  HR = exp(univ_recurrence_Pattern$coefficients),
+  lower_095 = univ_recurrence_Pattern$ci.lower,
+  upper_095 = univ_recurrence_Pattern$ci.upper,
+  pval = univ_recurrence_Pattern$prob
+)
+
+# Display the table
+kable(univ_recurrence_Pattern_table, digits = 3)
+```
+
+#EMT HE Pattern_Cox multivariate recurrence
+```{r}
+# Ensure TP53 is a factor
+TP53status_clinical$tp53_status_combined <- factor(TP53status_clinical$tp53_status_combined)
+
+# Set "Wt" as the reference level
+TP53status_clinical$tp53_status_combined <- relevel(TP53status_clinical$tp53_status_combined, ref = "Wt")
+
+
+multiv_recurrence_Pattern <- coxphf(
+  Surv(time_recurrence_surv_60m, recurrence_60m) ~ Pattern + figo_ini_ava + tp53_status_combined,
+  data = TP53status_clinical,
+  maxstep = 0.0001, 
+  maxit = 100000
+)
+
+# Extract coefficients, hazard ratios, and confidence intervals
+multiv_recurrence_Pattern_table <- data.frame(
+  coef = multiv_recurrence_Pattern$coefficients,
+  HR = exp(multiv_recurrence_Pattern$coefficients),
+  lower_095 = multiv_recurrence_Pattern$ci.lower,
+  upper_095 = multiv_recurrence_Pattern$ci.upper,
+  pval = multiv_recurrence_Pattern$prob
+)
+
+# Display the table
+kable(multiv_recurrence_Pattern_table, digits = 3)
+```
+
+
+
+
+#EMT HE Pattern_Cox univariate death
+```{r, echo=FALSE}
+multiv_death_Pattern <- coxphf(
+  Surv(time_death_surv_60m, death_disease_60m) ~ Pattern,
+  data = TP53status_clinical,
+  maxstep = 0.0001, 
+  maxit = 100000
+)
+
+# Extract coefficients, hazard ratios, and confidence intervals
+multiv_death_Pattern_table <- data.frame(
+  coef = multiv_death_Pattern$coefficients,
+  HR = exp(multiv_death_Pattern$coefficients),
+  lower_095 = multiv_death_Pattern$ci.lower,
+  upper_095 = multiv_death_Pattern$ci.upper,
+  pval = multiv_death_Pattern$prob
+)
+
+# Display the table
+kable(multiv_death_Pattern_table, digits = 3)
+
+```
+
+
+
+
+#EMT HE Pattern_Cox multivariate death
+```{r, echo=FALSE}
+multiv_death_Pattern <- coxphf(
+  Surv(time_death_surv_60m, death_disease_60m) ~ Pattern + figo_ini_ava + tp53_status_combined,
+  data = TP53status_clinical,
+  maxstep = 0.0001, 
+  maxit = 100000
+)
+
+# Extract coefficients, hazard ratios, and confidence intervals
+multiv_death_Pattern_table <- data.frame(
+  coef = multiv_death_Pattern$coefficients,
+  HR = exp(multiv_death_Pattern$coefficients),
+  lower_095 = multiv_death_Pattern$ci.lower,
+  upper_095 = multiv_death_Pattern$ci.upper,
+  pval = multiv_death_Pattern$prob
+)
+
+# Display the table
+kable(multiv_death_Pattern_table, digits = 3)
+
+```
+
+
+
+
+#We plot death and recurrence HR with a forst plot
+```{r}
+multiv_death_Pattern_table$Variable <- rownames(multiv_death_Pattern_table)
+multiv_recurrence_Pattern_table$Variable <- rownames(multiv_recurrence_Pattern_table)
+multiv_death_Pattern_table$Outcome <- "Death"
+multiv_recurrence_Pattern_table$Outcome <- "Recurrence"
+combined_table_Pattern <- rbind(multiv_death_Pattern_table, multiv_recurrence_Pattern_table)
+library(ggplot2)
+
+combined_table_Pattern$Variable <- factor(combined_table_Pattern$Variable, levels = c(
+  "figo_ini_ava1 (Advanced)",
+  "Patternspray",
+  "tp53_status_combinedMut"
+))
+
+forestplot_recurrence_death_Pattern<-ggplot(combined_table_Pattern, aes(x = reorder(Variable, -HR), y = HR, color = Outcome)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(aes(ymin = lower_095, ymax = upper_095), 
+                position = position_dodge(width = 0.6), 
+                width = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+  coord_flip() +
+  scale_y_log10() +
+  labs(
+    title = "Hazard Ratios for Death and Recurrence",
+    x = "",
+    y = "Hazard Ratio (log scale)",
+    color = "Outcome"
+  ) +
+  theme_minimal()
+
+forestplot_recurrence_death_Pattern
+
+
+#With pvalues
+combined_table_Pattern$p_label <- ifelse(
+  combined_table_Pattern$pval < 0.001, 
+  "p < 0.001", 
+  paste0("p = ", formatC(combined_table_Pattern$pval, format = "f", digits = 3))
+)
+
+
+
+forestplot_recurrence_death_Pattern_pvalues <- ggplot(combined_table_Pattern, aes(x = reorder(Variable, -HR), y = HR, color = Outcome)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(aes(ymin = lower_095, ymax = upper_095), 
+                position = position_dodge(width = 0.6), 
+                width = 0.2) +
+  geom_text(aes(label = p_label), 
+            position = position_dodge(width = 0.6), 
+            hjust = -0.2, 
+            size = 3) +  # Adjust size and hjust as needed
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+  coord_flip() +
+  scale_y_log10() +
+  labs(
+    title = "Hazard Ratios for Death and Recurrence",
+    x = "",
+    y = "Hazard Ratio (log scale)",
+    color = "Outcome"
+  ) +
+  theme_minimal()
+
+forestplot_recurrence_death_Pattern_pvalues
+
+```
+
+
+
+
+
+
+
+#5. Combination HE pattern + HE tumor budding
+
+
+#Combination HE pattern + HE tumor budding_Kaplan Meyer recurrence individual plot
+```{r}
+# Create the survival object
+surv_obj <- Surv(time = TP53status_clinical$time_recurrence_surv_60m, 
+                 event = as.numeric(TP53status_clinical$recurrence_60m == "Yes"))
+
+# Fit the Kaplan-Meier survival model
+km_fit <- survfit(surv_obj  ~ Combination2, data = TP53status_clinical)
+
+
+# Plot the Kaplan-Meier survival curves
+p <- ggsurvplot(
+  km_fit, 
+  data = TP53status_clinical,
+  pval = TRUE,                    # Display the p-value for the log-rank test
+  title = "Kaplan-Meier Survival Curve by Combination2_Recurrence",
+  risk.table = TRUE,              # Include the risk table
+  risk.table.height = 0.3,        # Adjust the height of the risk table
+  xlab = "Time to Event (Months)",# Label for x-axis
+  ylab = "Survival Probability",   # Label for y-axis
+  break.time.by = 10,               # Adjust time interval to match plot
+  palette = custom_colors, # Use the custom color palette
+  legend = c(0.8, 0.2),           # Adjust legend position (optional)
+  legend.title = "Clusters"  # Customize legend labels
+) 
+
+# Add the title to the plot
+p$plot <- p$plot + ggtitle("Kaplan-Meier Survival Curve by Combination2_Recurrence")
+
+# Display the plot
+print(p)
+
+
+```
+
+
+#Combination HE pattern + HE tumor budding_Kaplan Meyer death individual plot 
+```{r}
+# Create the survival object
+surv_obj <- Surv(time = TP53status_clinical$time_death_surv_60m, 
+                 event = as.numeric(TP53status_clinical$death_disease_60m == "Yes"))
+
+# Fit the Kaplan-Meier survival model
+km_fit <- survfit(surv_obj  ~ Combination2, data = TP53status_clinical)
+
+
+# Plot the Kaplan-Meier survival curves
+p <- ggsurvplot(
+  km_fit, 
+  data = TP53status_clinical,
+  pval = TRUE,                    # Display the p-value for the log-rank test
+  title = "Kaplan-Meier Survival Curve by Combination2_Death",
+  risk.table = TRUE,              # Include the risk table
+  risk.table.height = 0.3,        # Adjust the height of the risk table
+  xlab = "Time to Event (Months)",# Label for x-axis
+  ylab = "Survival Probability",   # Label for y-axis
+  break.time.by = 10,               # Adjust time interval to match plot
+  palette = custom_colors, # Use the custom color palette
+  legend = c(0.8, 0.2),           # Adjust legend position (optional)
+  legend.title = "Clusters"  # Customize legend labels
+) 
+
+# Add the title to the plot
+p$plot <- p$plot + ggtitle("Kaplan-Meier Survival Curve by Combination2_Death")
+
+# Display the plot
+print(p)
+```
+
+
+#Combination HE pattern + HE tumor budding_Cox univariate recurrence
+```{r}
+univ_recurrence_Combination2 <- coxphf(
+  Surv(time_recurrence_surv_60m, recurrence_60m) ~ Combination2,
+  data = TP53status_clinical,
+  maxstep = 0.0001, 
+  maxit = 100000
+)
+
+# Extract coefficients, hazard ratios, and confidence intervals
+univ_recurrence_Combination2_table <- data.frame(
+  coef = univ_recurrence_Combination2$coefficients,
+  HR = exp(univ_recurrence_Combination2$coefficients),
+  lower_095 = univ_recurrence_Combination2$ci.lower,
+  upper_095 = univ_recurrence_Combination2$ci.upper,
+  pval = univ_recurrence_Combination2$prob
+)
+
+# Display the table
+kable(univ_recurrence_Combination2_table, digits = 3)
+```
+
+
+#Combination HE pattern + HE tumor budding_Cox multivariate recurrence
+```{r}
+# Ensure TP53 is a factor
+TP53status_clinical$tp53_status_combined <- factor(TP53status_clinical$tp53_status_combined)
+
+# Set "Wt" as the reference level
+TP53status_clinical$tp53_status_combined <- relevel(TP53status_clinical$tp53_status_combined, ref = "Wt")
+
+
+# We check the distribution across groups
+# Ensure they are all factors
+TP53status_clinical$Combination2 <- factor(TP53status_clinical$Combination2)
+TP53status_clinical$figo_ini_ava <- factor(TP53status_clinical$figo_ini_ava)
+TP53status_clinical$tp53_status_combined <- factor(TP53status_clinical$tp53_status_combined)
+
+# Create the 3-way table
+table <- table(
+  TP53status_clinical$Combination2,
+  TP53status_clinical$figo_ini_ava,
+  TP53status_clinical$tp53_status_combined
+)
+
+# Print table
+table
+
+# We see that there are groups with 1 case... so we will have to force the results
+
+#As there are problems with sparse data due to 3 variable combination and small groups we use this other paramenters to obtain results
+multiv_recurrence_Combination2 <- coxphf(
+  Surv(time_recurrence_surv_60m, recurrence_60m) ~ Combination2 + figo_ini_ava + tp53_status_combined,
+  data = TP53status_clinical,
+  maxstep = 1e-6,
+  maxit = 1e6
+)
+
+# Extract coefficients, hazard ratios, and confidence intervals
+multiv_recurrence_Combination2_table <- data.frame(
+  coef = multiv_recurrence_Combination2$coefficients,
+  HR = exp(multiv_recurrence_Combination2$coefficients),
+  lower_095 = multiv_recurrence_Combination2$ci.lower,
+  upper_095 = multiv_recurrence_Combination2$ci.upper,
+  pval = multiv_recurrence_Combination2$prob
+)
+
+# Display the table
+kable(multiv_recurrence_Combination2_table, digits = 3)
+```
+
+
+
+
+#Combination HE pattern + HE tumor budding_Cox univariate death
+```{r, echo=FALSE}
+multiv_death_Combination2 <- coxphf(
+  Surv(time_death_surv_60m, death_disease_60m) ~ Combination2 ,
+  data = TP53status_clinical,
+  maxstep = 0.0001, 
+  maxit = 100000
+)
+
+# Extract coefficients, hazard ratios, and confidence intervals
+multiv_death_Combination2_table <- data.frame(
+  coef = multiv_death_Combination2$coefficients,
+  HR = exp(multiv_death_Combination2$coefficients),
+  lower_095 = multiv_death_Combination2$ci.lower,
+  upper_095 = multiv_death_Combination2$ci.upper,
+  pval = multiv_death_Combination2$prob
+)
+
+# Display the table
+kable(multiv_death_Combination2_table, digits = 3)
+
+```
+
+
+
+
+#Combination HE pattern + HE tumor budding_Cox multivariate death
+```{r}
+multiv_death_Combination2 <- coxphf(
+  Surv(time_death_surv_60m, death_disease_60m) ~ Combination2 + figo_ini_ava + tp53_status_combined,
+  data = TP53status_clinical,
+  maxstep = 0.0001, 
+  maxit = 100000
+)
+
+# Extract coefficients, hazard ratios, and confidence intervals
+multiv_death_Combination2_table <- data.frame(
+  coef = multiv_death_Combination2$coefficients,
+  HR = exp(multiv_death_Combination2$coefficients),
+  lower_095 = multiv_death_Combination2$ci.lower,
+  upper_095 = multiv_death_Combination2$ci.upper,
+  pval = multiv_death_Combination2$prob
+)
+
+# Display the table
+kable(multiv_death_Combination2_table, digits = 3)
+```
+
+
+#We plot death and recurrence in a forest plot
+```{r}
+multiv_death_Combination2_table$Variable <- rownames(multiv_death_Combination2_table)
+multiv_recurrence_Combination2_table$Variable <- rownames(multiv_recurrence_Combination2_table)
+multiv_death_Combination2_table$Outcome <- "Death"
+multiv_recurrence_Combination2_table$Outcome <- "Recurrence"
+combined_table_Combination2 <- rbind(multiv_death_Combination2_table, multiv_recurrence_Combination2_table)
+library(ggplot2)
+
+combined_table_Combination2$Variable <- factor(combined_table_Combination2$Variable, levels = c(
+  "figo_ini_ava1 (Advanced)",
+  "Combination2Spray_highbudding",
+  "Combination2Spray_lowbudding",
+  "tp53_status_combinedMut"
+))
+
+forestplot_recurrence_death_Combination2<-ggplot(combined_table_Combination2, aes(x = reorder(Variable, -HR), y = HR, color = Outcome)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(aes(ymin = lower_095, ymax = upper_095), 
+                position = position_dodge(width = 0.6), 
+                width = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+  coord_flip() +
+  scale_y_log10() +
+  labs(
+    title = "Hazard Ratios for Death and Recurrence",
+    x = "",
+    y = "Hazard Ratio (log scale)",
+    color = "Outcome"
+  ) +
+  theme_minimal()
+
+forestplot_recurrence_death_Combination2
+
+
+#With pvalues
+combined_table_Combination2$p_label <- ifelse(
+  combined_table_Combination2$pval < 0.001, 
+  "p < 0.001", 
+  paste0("p = ", formatC(combined_table_Combination2$pval, format = "f", digits = 3))
+)
+
+
+
+forestplot_recurrence_death_Combination2_pvalues <- ggplot(combined_table_Combination2, aes(x = reorder(Variable, -HR), y = HR, color = Outcome)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(aes(ymin = lower_095, ymax = upper_095), 
+                position = position_dodge(width = 0.6), 
+                width = 0.2) +
+  geom_text(aes(label = p_label), 
+            position = position_dodge(width = 0.6), 
+            hjust = -0.2, 
+            size = 3) +  # Adjust size and hjust as needed
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40") +
+  coord_flip() +
+  scale_y_log10() +
+  labs(
+    title = "Hazard Ratios for Death and Recurrence",
+    x = "",
+    y = "Hazard Ratio (log scale)",
+    color = "Outcome"
+  ) +
+  theme_minimal()
+
+forestplot_recurrence_death_Combination2_pvalues
+
+```
+
+
+
